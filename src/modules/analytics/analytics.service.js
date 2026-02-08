@@ -48,6 +48,11 @@ class AnalyticsService {
     } catch (err) {
       throw err;
     }
+    return new mongoose.Types.ObjectId(accountId);
+  }
+
+  async getMonthlyReport(userId, params) {
+    return this.getReport({ userId, ...params });
   }
 
   async recomputeMonthlySnapshot(userId, accountId, month) {
