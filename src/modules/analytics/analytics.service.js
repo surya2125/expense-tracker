@@ -7,46 +7,11 @@ const { AppError } = require("../../shared/errors/appError");
 
 class AnalyticsService {
   normalizeAccountId(accountId) {
-    if (!accountId || !mongoose.Types.ObjectId.isValid(accountId)) {
+    if (!accountId) {
+      return null;
+    }
+    if (!mongoose.Types.ObjectId.isValid(accountId)) {
       throw new AppError("Valid account ID is required", { status: 400 });
-    }
-    return new mongoose.Types.ObjectId(accountId);
-  }
-
-  async getMonthlyReport(userId, month, accountId) {
-    if (!userId || !month) {
-      throw new AppError("User ID and month are required", { status: 400 });
-    }
-    try {
-      const normalizedAccountId = this.normalizeAccountId(accountId);
-      const account = await Account.findOne({
-        _id: normalizedAccountId,
-        userId,
-      }).lean();
-      if (!account) {
-        throw new AppError("Account not found", { status: 404 });
-      }
-      let snapshot = await MonthlySnapshot.findOne({
-        userId,
-        accountId: normalizedAccountId,
-        month,
-      });
-
-      const isStale =
-        !snapshot ||
-        (account.lastTransactionAt &&
-          snapshot.lastComputedAt < account.lastTransactionAt);
-
-      if (isStale) {
-        snapshot = await this.recomputeMonthlySnapshot(
-          userId,
-          normalizedAccountId,
-          month,
-        );
-      }
-      return snapshot;
-    } catch (err) {
-      throw err;
     }
     return new mongoose.Types.ObjectId(accountId);
   }
@@ -199,28 +164,79 @@ class AnalyticsService {
     );
   }
 
-  async getRangeReport(userId, startDate, endDate, accountId) {
-    if (!userId || !startDate || !endDate) {
-      throw new AppError("User ID, start date, and end date are required", {
+  async getReport({
+    userId,
+    month,
+    week,
+    startDate,
+    endDate,
+    accountId,
+    type,
+  }) {
+    if (!userId) {
+      throw new AppError("User ID is required", { status: 400 });
+    }
+
+    const normalizedAccountId = this.normalizeAccountId(accountId);
+    let normalizedType = null;
+    if (type) {
+      if (!["EXPENSE", "INCOME"].includes(type)) {
+        throw new AppError("Type must be EXPENSE or INCOME", { status: 400 });
+      }
+      normalizedType = type;
+    }
+
+    let start;
+    let end;
+
+    if (startDate || endDate) {
+      if (!startDate || !endDate) {
+        throw new AppError("Start date and end date are required", {
+          status: 400,
+        });
+      }
+      start = dayjs(startDate).startOf("day");
+      end = dayjs(endDate).endOf("day");
+    } else if (month) {
+      start = dayjs(month).startOf("month");
+      end = dayjs(month).endOf("month");
+    } else if (week) {
+      start = dayjs(week).startOf("week");
+      end = dayjs(week).endOf("week");
+    } else {
+      throw new AppError("Month, week, or date range is required", {
         status: 400,
       });
     }
 
-    const normalizedAccountId = this.normalizeAccountId(accountId);
-    const start = dayjs(startDate).startOf("day").toDate();
-    const end = dayjs(endDate).endOf("day").toDate();
-
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    if (!start.isValid() || !end.isValid()) {
       throw new AppError("Invalid date range", { status: 400 });
+    }
+
+    if (normalizedAccountId) {
+      const account = await Account.findOne({
+        _id: normalizedAccountId,
+        userId,
+      }).lean();
+      if (!account) {
+        throw new AppError("Account not found", { status: 404 });
+      }
+    }
+
+    const matchBase = {
+      userId,
+      isDeleted: false,
+    };
+
+    if (normalizedAccountId) {
+      matchBase.accountId = normalizedAccountId;
     }
 
     const openingAgg = await Transaction.aggregate([
       {
         $match: {
-          userId,
-          isDeleted: false,
-          date: { $lt: start },
-          $or: [{ accountId: normalizedAccountId }],
+          ...matchBase,
+          date: { $lt: start.toDate() },
         },
       },
       {
@@ -231,21 +247,11 @@ class AnalyticsService {
               $switch: {
                 branches: [
                   {
-                    case: {
-                      $and: [
-                        { $eq: ["$type", "INCOME"] },
-                        { $eq: ["$accountId", normalizedAccountId] },
-                      ],
-                    },
+                    case: { $eq: ["$type", "INCOME"] },
                     then: "$amount",
                   },
                   {
-                    case: {
-                      $and: [
-                        { $eq: ["$type", "EXPENSE"] },
-                        { $eq: ["$accountId", normalizedAccountId] },
-                      ],
-                    },
+                    case: { $eq: ["$type", "EXPENSE"] },
                     then: { $multiply: ["$amount", -1] },
                   },
                 ],
@@ -259,108 +265,63 @@ class AnalyticsService {
 
     const openingBalance = openingAgg[0]?.balance || 0;
 
-    const rangeAgg = await Transaction.aggregate([
-      {
-        $match: {
-          userId,
-          isDeleted: false,
-          date: { $gte: start, $lte: end },
-          $or: [{ accountId: normalizedAccountId }],
-        },
-      },
+    const rangeMatch = {
+      ...matchBase,
+      date: { $gte: start.toDate(), $lte: end.toDate() },
+      ...(normalizedType ? { type: normalizedType } : {}),
+    };
+
+    const totalsAgg = await Transaction.aggregate([
+      { $match: rangeMatch },
       {
         $group: {
           _id: null,
           income: {
             $sum: {
-              $cond: [
-                {
-                  $and: [
-                    { $eq: ["$type", "INCOME"] },
-                    { $eq: ["$accountId", normalizedAccountId] },
-                  ],
-                },
-                "$amount",
-                0,
-              ],
+              $cond: [{ $eq: ["$type", "INCOME"] }, "$amount", 0],
             },
           },
           expense: {
             $sum: {
-              $cond: [
-                {
-                  $and: [
-                    { $eq: ["$type", "EXPENSE"] },
-                    { $eq: ["$accountId", normalizedAccountId] },
-                  ],
-                },
-                "$amount",
-                0,
-              ],
+              $cond: [{ $eq: ["$type", "EXPENSE"] }, "$amount", 0],
             },
           },
         },
       },
     ]);
 
-    const income = rangeAgg[0]?.income || 0;
-    const expense = rangeAgg[0]?.expense || 0;
+    const income = totalsAgg[0]?.income || 0;
+    const expense = totalsAgg[0]?.expense || 0;
     const cashflow = income - expense;
+    const closingBalance = openingBalance + cashflow;
 
-    return {
-      userId,
-      accountId: normalizedAccountId,
-      startDate: start,
-      endDate: end,
-      openingBalance,
-      income,
-      expense,
-      cashflow,
-      closingBalance: openingBalance + cashflow,
-    };
-  }
-
-  async getCategoryBreakdown(userId, startDate, endDate, accountId) {
-    if (!userId || !startDate || !endDate) {
-      throw new AppError("User ID, start date, and end date are required", {
-        status: 400,
-      });
-    }
-
-    const normalizedAccountId = accountId
-      ? this.normalizeAccountId(accountId)
-      : null;
-    const start = dayjs(startDate).startOf("day").toDate();
-    const end = dayjs(endDate).endOf("day").toDate();
-
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-      throw new AppError("Invalid date range", { status: 400 });
-    }
-
-    const match = {
-      userId,
-      isDeleted: false,
-      type: "EXPENSE",
-      date: { $gte: start, $lte: end },
-    };
-
-    if (normalizedAccountId) {
-      match.accountId = normalizedAccountId;
-    }
-
-    return Transaction.aggregate([
-      { $match: match },
+    const spendType = normalizedType || "EXPENSE";
+    const highestDayAgg = await Transaction.aggregate([
+      { $match: { ...rangeMatch, type: spendType } },
       {
         $group: {
-          _id: "$categoryId",
+          _id: {
+            $dateToString: { format: "%Y-%m-%d", date: "$date" },
+          },
           total: { $sum: "$amount" },
-          transactionCount: { $sum: 1 },
         },
       },
+      { $sort: { total: -1 } },
+      { $limit: 1 },
+    ]);
+
+    const highestDay = highestDayAgg[0]
+      ? { date: highestDayAgg[0]._id, total: highestDayAgg[0].total }
+      : null;
+
+    const highestTransactionAgg = await Transaction.aggregate([
+      { $match: { ...rangeMatch, type: spendType } },
+      { $sort: { amount: -1 } },
+      { $limit: 1 },
       {
         $lookup: {
           from: "categories",
-          localField: "_id",
+          localField: "categoryId",
           foreignField: "_id",
           as: "category",
         },
@@ -369,14 +330,86 @@ class AnalyticsService {
       {
         $project: {
           _id: 0,
-          categoryId: "$_id",
+          transactionId: "$_id",
+          amount: 1,
+          date: 1,
+          type: 1,
+          accountId: 1,
+          categoryId: 1,
           categoryName: "$category.name",
-          total: 1,
-          transactionCount: 1,
         },
       },
-      { $sort: { total: -1 } },
     ]);
+
+    const highestTransaction = highestTransactionAgg[0] || null;
+
+    let categoryBreakdown = [];
+    let highestCategory = null;
+
+    if (spendType === "EXPENSE") {
+      const categoryAgg = await Transaction.aggregate([
+        {
+          $match: {
+            ...rangeMatch,
+            type: spendType,
+          },
+        },
+        {
+          $group: {
+            _id: "$categoryId",
+            total: { $sum: "$amount" },
+            transactionCount: { $sum: 1 },
+          },
+        },
+        {
+          $lookup: {
+            from: "categories",
+            localField: "_id",
+            foreignField: "_id",
+            as: "category",
+          },
+        },
+        { $unwind: { path: "$category", preserveNullAndEmptyArrays: true } },
+        {
+          $project: {
+            _id: 0,
+            categoryId: "$_id",
+            categoryName: "$category.name",
+            total: 1,
+            transactionCount: 1,
+          },
+        },
+        { $sort: { total: -1 } },
+      ]);
+
+      categoryBreakdown = categoryAgg;
+      if (categoryAgg[0]) {
+        highestCategory = {
+          categoryId: categoryAgg[0].categoryId,
+          categoryName: categoryAgg[0].categoryName,
+          total: categoryAgg[0].total,
+        };
+      }
+    }
+
+    return {
+      userId,
+      accountId: normalizedAccountId,
+      range: {
+        startDate: start.toDate(),
+        endDate: end.toDate(),
+      },
+      type: normalizedType,
+      openingBalance,
+      income,
+      expense,
+      cashflow,
+      closingBalance,
+      highestDay,
+      highestTransaction,
+      highestCategory,
+      categoryBreakdown,
+    };
   }
 }
 
